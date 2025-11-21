@@ -1,7 +1,10 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  /* config options here */
-  reactCompiler: true,
+  output: "standalone",
+  serverExternalPackages: [], // ensures standalone works with turbopack
+  experimental: {
+    optimizePackageImports: ["react", "react-dom"],
+  },
 };
 
-export default nextConfig;
+module.exports = nextConfig;
