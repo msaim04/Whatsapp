@@ -1,0 +1,176 @@
+name: Deploy Frontend (WhatsApp Website)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy-frontend:
+    name: Deploy WhatsApp Website
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    # ---------------------------------------------------
+    # 1. Checkout
+    # ---------------------------------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ---------------------------------------------------
+    # 2. Setup Node.js (NPM)
+    # ---------------------------------------------------
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.9.0
+        cache: npm
+
+    # ---------------------------------------------------
+    # 3. Install deps (NPM)
+    # ---------------------------------------------------
+    - name: Install dependencies
+      run: npm ci
+
+    # ---------------------------------------------------
+    # 4. Build Next.js (standalone)
+    # ---------------------------------------------------
+    - name: Build Next.js project
+      run: |
+        echo "Building Next.js..."
+        npm run build
+    # ---------------------------------------------------
+    # 5. Validate build output
+    # ---------------------------------------------------
+    - name: Validate build output
+      run: |
+        if [ ! -d ".next/standalone" ]; then
+          echo "❌ Standalone build missing."
+          exit 1
+        fi
+        if [ ! -d ".next/static" ]; then
+          echo "❌ Static folder missing."
+          exit 1
+        fi
+        echo "✔ Build files verified."
+    # ---------------------------------------------------
+    # 6. Backup current server version
+    # ---------------------------------------------------
+    - name: Backup current server version
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          BACKUP=/var/www/whatsapp-website-backups
+          TARGET=/var/www/whatsapp-website
+          mkdir -p $BACKUP
+          if [ -d "$TARGET" ]; then
+            echo "Rotating backups..."
+            rm -rf "$BACKUP/backup-3"
+            mv "$BACKUP/backup-2" "$BACKUP/backup-3" 2>/dev/null || true
+            mv "$BACKUP/backup-1" "$BACKUP/backup-2" 2>/dev/null || true
+            mv "$TARGET" "$BACKUP/backup-1"
+            echo "✔ Backup created."
+          else
+            echo "No previous version found."
+          fi
+    # ---------------------------------------------------
+    # 7. Upload build output to server
+    # ---------------------------------------------------
+    - name: Upload build files
+      run: |
+        echo "Preparing SSH..."
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+        TARGET="/var/www/whatsapp-website"
+        echo "Uploading build..."
+        rsync -az --delete .next/standalone/ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:$TARGET/
+        rsync -az .next/static/ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:$TARGET/.next/static/
+        rsync -az public/ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:$TARGET/public/
+        rsync -az package.json package-lock.json ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:$TARGET/
+        echo "✔ Upload complete."
+    # ---------------------------------------------------
+    # 8. Install deps on server (production only)
+    # ---------------------------------------------------
+    - name: Install dependencies on server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          cd /var/www/whatsapp-website
+          npm ci --omit=dev
+          echo "✔ Dependencies installed."
+    # ---------------------------------------------------
+    # 9. Restart PM2
+    # ---------------------------------------------------
+    - name: Start PM2
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          cd /var/www/whatsapp-website
+          pm2 delete whatsapp_frontend || true
+          PORT=3002 pm2 start server.js --name whatsapp_frontend
+          pm2 save
+          echo "✔ PM2 restarted."
+    # ---------------------------------------------------
+    # 10. Reload Nginx
+    # ---------------------------------------------------
+    - name: Reload Nginx
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          sudo nginx -t && sudo systemctl reload nginx
+          echo "✔ Nginx reloaded."
+    # ---------------------------------------------------
+    # 11. Health Check
+    # ---------------------------------------------------
+    - name: Health Check
+      id: health
+      run: |
+        URL="${{ secrets.FRONTEND_URL }}"
+        STATUS=$(curl -o /dev/null -s -w "%{http_code}" "$URL")
+        echo "Status: $STATUS"
+        if [ "$STATUS" == "200" ]; then
+          echo "health=ok" >> $GITHUB_OUTPUT
+        else
+          echo "health=fail" >> $GITHUB_OUTPUT
+        fi
+    # ---------------------------------------------------
+    # 12. Rollback if failed
+    # ---------------------------------------------------
+    - name: Rollback
+      if: steps.health.outputs.health == 'fail'
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        script: |
+          BACKUP=/var/www/whatsapp-website-backups/backup-1
+          TARGET=/var/www/whatsapp-website
+          if [ -d "$BACKUP" ]; then
+            rm -rf "$TARGET"
+            mv "$BACKUP" "$TARGET"
+            cd "$TARGET"
+            pm2 delete whatsapp_frontend || true
+            PORT=3002 pm2 start server.js --name whatsapp_frontend
+            pm2 save
+            sudo systemctl reload nginx
+            echo "✔ Rollback complete."
+          else
+            echo "❌ Rollback failed — no backup."
+            exit 1
