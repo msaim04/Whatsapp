@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
+  output: "standalone",
   serverExternalPackages: [],
   experimental: {
     optimizePackageImports: ["react", "react-dom"]
@@ -8,3 +9,5 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;
+
+
